@@ -1,0 +1,664 @@
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include "Adafruit_VCNL4010.h"
+#include <Pixy2.h>
+#include <Pixy2UART.h>
+#include <SPI.h>
+#include <WiFiNINA.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// COMMUNICATION LAYER INITILISATION
+char ssid[] = "BID4R_Swarm_AP";
+char pass[] = "xXSecure_Password25Xx";
+//IP Address for lab desktop
+const char* mqtt_server = "155.31.130.4";
+const int mqtt_port = 1883;
+const char* unit_id = "014";  // Each robot needs unique ID
+// DO NOT FORGET TO DEFINE UNIT SPECIFIC PROXMITY SENSOR AND BATTERY MONITORING R_SISTOR VALUES
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// PIN DEFENTIONS
+#define TEMP_DQ 2
+#define LED_DAT_OUT 4             //LED DATA PIN
+#define MOTOR_AIN1 9             // Motor 1 PWM speed control
+#define MOTOR_AIN2 10            // Motor 1 Direction Control
+#define MOTOR_BIN2 11            // Motor 2 Direction Control
+#define MOTOR_BIN1 3            // Motor 2 PWM speed control
+#define BAT_RESISTOR_1_2 A1      
+#define PROXIMITY_SDA A4         // Proximity Sensor SDA (I2C communication)
+#define PROXIMITY_SCL A5         // Proximity Sensor SCL (I2C communication)
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// PREDEFINED - LED COLORS
+#define COLOR_OFF strip.Color(0, 0, 0)
+#define COLOR_RED strip.Color(0, 255, 0)
+#define COLOR_BLUE strip.Color(0, 0, 255)
+#define COLOR_GREEN strip.Color(255, 0, 0)
+#define COLOR_YELLOW strip.Color(255, 255, 0)
+#define COLOR_MAGENTA strip.Color(0, 255, 255)
+// To define specific colors use G, R, B format - beacuse neopixel is just fuckin weird like that
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// HARDWARE COMPONENT DEFENIONS
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(1, LED_DAT_OUT, NEO_GRB + NEO_KHZ800);
+Adafruit_VCNL4010 vcnl;
+Pixy2UART pixy;
+
+// MQTT + WIFI DEFENTIONS
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+//SENSOR SUITE STATUS INITIALISATION
+uint32_t currentLedColor = COLOR_OFF;  // Track current LED color
+bool currentProxStatus = false;        // Track current proximity detection status
+float currentBatVoltage = 0.0;         // Track current battery voltage
+int currentDetectedSignature = -1;     // Track current detected color signature -1 = none)
+
+//GOTO INITIALISATION
+float tX = 0, tY = 0; //Target position from GOTO command
+float tH = 0;     // degrees
+float cX = 0, cY = 0, cH = 0; //Current position from GS, updated frequently
+bool PosAcheived = false;
+bool motorKickDone = false;
+
+// STATE DEFENTION FOR DELAY HANDLING
+enum ObstacleState { NONE, STOPPED, WAITING, AVOIDING };
+enum DriveMode { STANDBY, MISSION, GOTO, CHARGE };
+ObstacleState obstacleState = NONE;
+DriveMode currentMode = STANDBY;
+unsigned long obstacleStartTime = 0;
+bool avoidLeft = false;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// COMM FREQUENCY SETTINGS
+const unsigned long NOMINAL_STATUS_INTERVAL = 200;    
+const unsigned long LED_STATUS_INTERVAL = NOMINAL_STATUS_INTERVAL;    
+const unsigned long PROX_STATUS_INTERVAL = NOMINAL_STATUS_INTERVAL;   
+const unsigned long BAT_STATUS_INTERVAL = NOMINAL_STATUS_INTERVAL;   
+const unsigned long COLOR_STATUS_INTERVAL = NOMINAL_STATUS_INTERVAL; 
+const unsigned long MODE_STATUS_INTERVAL = NOMINAL_STATUS_INTERVAL;
+unsigned long lastLedStatusTime = 0;
+unsigned long lastProxStatusTime = 0;
+unsigned long lastBatStatusTime = 0;
+unsigned long lastColorStatusTime = 0;
+unsigned long lastModeStatusTime = 0;
+
+// MOVEMENT STATUS INITIALISATION
+unsigned long moveStartTime = 0;
+unsigned long moveDuration = 0;
+bool isInDelay = false;
+unsigned long delayStartTime = 0;
+int currentMotionType = 0;
+
+// MOVEMENT SPEED SETTINGS
+#define BASE_SPEED 100
+#define CURVE_SPEED BASE_SPEED * 0.7 // For arcing motions requiring translation
+#define MIN_SPEED BASE_SPEED * 0.6   // For rotational or "precise" movements [NOTE: Often causes stalls when run from dead stop, just give it a little push]
+#define TURN_SPEED 200               // For obstacle pivoting
+#define PROXIMITY_THRESHOLD 2350
+#define EMERGENCY_KICK_SPEED 255        // CAPSTONE ADD: SHORT BURST VALUE IF THE CONSTINUOUS CW DETACHMENT MOVEMENT DOESNT WORK.
+#define MAX_DETACH_SPEED 250            // CAPSTONE ADD: MAXIMUM SPEED FOR THE SERVO TO BE ABLE TO HELP WITH DETACHING FROM MAGNETIC POGO
+
+// MOVEMENT TIMING SETTINGS
+#define FORWARD_MIN_DURATION 1000
+#define FORWARD_MAX_DURATION 2000
+#define TURN_MIN_DURATION 500
+#define TURN_MAX_DURATION 800
+#define BETWEEN_MOVE_DELAY 200
+#define AVOID_WAIT_TIME 2000
+#define AVOID_REVERSE_PULSE 400
+
+// CAPSTONE ADD: CHARGING SETTINGS
+#define CHARGE_COMPLETE_VOLTAGE 3.9f    // CAPSTONE ADD: THRESHOLD FOR MAX CHARGE IN (v)
+#define MIN_CHARGE_FOR_ASSIST 3.5f      // CAPSTONE ADD: MINIMUM CHARGE TO RESPOND TO EMERGENCY REQUESTS IN (v)
+#define DETACH_TURN_DIRECTION 90.0f     // CAPSTONE ADD: THE DIRECTION IN (deg) FOR THE ROBOT TO DETACH FROM THE CHARGING STATION
+#define DETACH_ROTATION_TIME 3000       // CAPSTONE ADD: 90 DEGREE CW ROTATION IN (ms)
+
+//GOTO TOLERANCE AND TUNING SETTINGS
+const float kP_heading = 0.75;    // proportional gain
+const float kP_rotation = 0.3;    // proportional gain
+const float gotoPosTol = 50;      // mm allowable pos error
+const float gotoHeadTol = 15.0;   //Degrees allowable heading error
+unsigned long gotoStartTime = 0;
+unsigned long kickStartTime = 0;
+unsigned long lastTurnUpdate = 0;
+const unsigned long gotoTimeoutMs = 1000 * 30;  // GOTO timeout watchdog timer
+const unsigned long KS_MS = 250;  // Kickstart Ramp time (ms)
+const unsigned long turnPulse = 200;            // ms between rotation checks
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// HARDWARE + MOVEMENT FUNCTION DEFENITIONS
+// READS BATTERY VOLTAGE
+double get_bat_voltage(int pin = BAT_RESISTOR_1_2, double divided_max = 2.935, double max_bat_voltage = 4.2) {
+  return (((double)analogRead(pin)) * max_bat_voltage) / ((divided_max / 3.3) * 1023);
+}
+// RETURNS BATTERY VOLTAGE 
+void checkBatteryVoltage() {
+  currentBatVoltage = get_bat_voltage();
+}
+// SETS THE COLOR OF THE ONBOARD LED
+void setLED(uint32_t color) {
+  currentLedColor = color;
+  strip.setPixelColor(0, color);
+  strip.show();
+}
+// COMMANDS MOVES BY ALTERING L/R MOTOR DIRECTION AND SPEED
+void setMotorDirection(bool leftFwd, bool rightFwd, int leftSpeed, int rightSpeed) {
+  analogWrite(MOTOR_AIN1, leftSpeed);
+  digitalWrite(MOTOR_AIN2, leftFwd ? LOW : HIGH);
+  analogWrite(MOTOR_BIN1, rightSpeed);
+  digitalWrite(MOTOR_BIN2, rightFwd ? LOW : HIGH);
+}
+// STOPS BOTH MOTORS TO COMMAND STOPS
+void stopMotors() {
+  analogWrite(MOTOR_AIN1, 0);
+  analogWrite(MOTOR_BIN1, 0);
+  digitalWrite(MOTOR_AIN2, LOW);
+  digitalWrite(MOTOR_BIN2, LOW);
+}
+// CURVED RANDOM WALK MOTION GENERATOR
+void randomCurve() {
+  currentMotionType = random(0, 3);  // 0 = forward, 1 = curve left, 2 = curve right
+  moveStartTime = millis();
+  // For curves you might choose different durations:
+  if (currentMotionType == 0) {
+    moveDuration = random(FORWARD_MIN_DURATION, FORWARD_MAX_DURATION);
+  } else {
+    moveDuration = random(TURN_MIN_DURATION, TURN_MAX_DURATION);
+  }
+  if (currentMotionType == 1) {
+    // Curve left
+    setMotorDirection(true, true, CURVE_SPEED, BASE_SPEED);
+  } else if (currentMotionType == 2) {
+    // Curve right
+    setMotorDirection(true, true, BASE_SPEED, CURVE_SPEED);
+  } else {
+    // Straight forward
+    setMotorDirection(true, true, BASE_SPEED, BASE_SPEED);
+  }
+  isInDelay = false;  // ensure motion state
+}
+//BOOL OBSTACLE DETECTOR
+bool isObstacleAhead() {
+  uint16_t prox = vcnl.readProximity();
+  return prox > PROXIMITY_THRESHOLD;
+}
+//FSM LOGIC HANDLER
+void handleObstacle() {
+  unsigned long now = millis();
+
+  switch (obstacleState) {
+    case NONE:
+      if (isObstacleAhead()) {
+        stopMotors();
+        setLED(COLOR_GREEN);
+        obstacleStartTime = now;
+        obstacleState = STOPPED;
+      }
+    break;
+
+    case STOPPED:
+      if (now - obstacleStartTime >= 200) {
+        setLED(COLOR_RED);
+        obstacleStartTime = now;
+        obstacleState = WAITING;
+      }
+    break;
+
+    case WAITING:
+      if (now - obstacleStartTime >= AVOID_WAIT_TIME) {
+        if (isObstacleAhead()) {
+          setLED(COLOR_BLUE);
+          avoidLeft = random(0, 2);
+          obstacleStartTime = now;
+          obstacleState = AVOIDING;
+
+          //Move back a little to make sure unit wont collide with wall
+          setMotorDirection(false, false, TURN_SPEED, TURN_SPEED);
+          delay(AVOID_REVERSE_PULSE);
+          stopMotors();
+
+          if (avoidLeft) {
+            setMotorDirection(false, true, TURN_SPEED, TURN_SPEED);
+          } else {
+            setMotorDirection(true, false, TURN_SPEED, TURN_SPEED);
+          }
+        } else {
+          obstacleState = NONE;
+          strip.clear();
+        }
+      }
+    break;
+
+    case AVOIDING:
+      if (now - obstacleStartTime >= 500) {
+        stopMotors();
+        obstacleStartTime = now;
+        obstacleState = NONE;
+      }
+    break;
+  }
+}
+//STALL BLOCKER - Limits di/dt to blunt instantaneous powerdraw
+void stallblock() {
+  // If kick already completed, do nothing
+  if (motorKickDone) return;
+
+  unsigned long now = millis();
+
+  // First entry
+  if (kickStartTime == 0) {
+    kickStartTime = now;
+  }
+
+  unsigned long elapsed = now - kickStartTime;
+
+  if (elapsed >= KS_MS) {
+    // Ramp complete
+    setMotorDirection(true, true, TURN_SPEED, TURN_SPEED);
+    motorKickDone = true;
+    kickStartTime = 0;   // reset for next GOTO
+    return;
+  }
+
+  // Linear ramp 0 -> CURVE_SPEED
+  int pwm = map(elapsed, 0, KS_MS, 0, TURN_SPEED);
+  pwm = constrain(pwm, 0, TURN_SPEED);
+
+  setMotorDirection(true, true, pwm, pwm);
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//COMMUNICATION LAYER FUNCTION DEFENITIONS
+// SETUP FUNCTION FOR WIFI - DISPLAYS CONNECTION STATUS 
+void setup_wifi() {
+  Serial.print("Connecting to WiFi");
+  while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+// SETUP FUNCTION FOR MQTT - DISPLAYS CONNECTIONS STATUS AND ERRORS
+void reconnect_mqtt() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    String clientId = "Unit-" + String(unit_id);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("connected!");
+      String cmdTopic = "UI/" + String(unit_id) + "/cmd";
+      String poseTopic = "UI/" + String(unit_id) + "/pose";
+      mqttClient.subscribe(cmdTopic.c_str());
+      mqttClient.subscribe(poseTopic.c_str());
+    } 
+    else {
+      Serial.print("failed, rc=");
+      Serial.println(mqttClient.state());
+    }
+  }
+}
+// SENDS LED STATUS - led: {'color': 'blue', 'timestamp': 24148}
+void sendLedStatus() {
+  String topic = "UI/" + String(unit_id) + "/led";
+  StaticJsonDocument<64> doc;
+  
+  // Convert LED color to readable string for ground station
+  String colorName = "unknown";
+  if (currentLedColor == COLOR_OFF) colorName = "off";
+  else if (currentLedColor == COLOR_RED) colorName = "red";
+  else if (currentLedColor == COLOR_BLUE) colorName = "blue";
+  else if (currentLedColor == COLOR_GREEN) colorName = "green";
+  
+  doc["col"] = colorName;
+  doc["timestamp"] = millis();  // For debugging timing issues
+  
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str());
+  
+}
+// SENDS PROX STATUS - proximity: {'obs_det': False, 'timestamp': 24153}
+void sendProxStatus() {
+  String topic = "UI/" + String(unit_id) + "/prox";
+  StaticJsonDocument<64> doc;
+  
+  // Update current proximity status
+  currentProxStatus = isObstacleAhead();
+  
+  doc["obs_det"] = currentProxStatus;
+  doc["timestamp"] = millis();
+  
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str());
+  
+  //Serial.print("Proximity Status: ");
+  //Serial.println(currentProxStatus ? "OBSTACLE" : "CLEAR");
+}
+// SENDS BAT VOLTAGE STATUS - battery: {'vt': 0.004616, 'timestamp': 24155}
+void sendBatStatus() {
+  String topic = "UI/" + String(unit_id) + "bat";
+  StaticJsonDocument<64> doc;
+  
+  currentBatVoltage = get_bat_voltage();
+  
+  doc["vt"] = currentBatVoltage;
+  doc["timestamp"] = millis();
+  
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str());
+  
+  //Serial.print("Battery Status: ");
+  //Serial.print(currentBatVoltage, 2);
+  //Serial.println("V");
+}
+// SENDS LARGEST PIXY COLOR DETECTION - color: {'sig': -1, 'det': False, 'timestamp': 25159, 'tBlcks': 0}
+void sendColorStatus() {
+  pixy.ccc.getBlocks();
+  String topic = "UI/" + String(unit_id) + "/col";
+  StaticJsonDocument<128> doc;
+    
+  if (pixy.ccc.numBlocks > 0) {
+    // Get the largest detected block (first in array after sorting)
+    Block largestBlock = pixy.ccc.blocks[0];
+    currentDetectedSignature = largestBlock.m_signature;
+    
+    doc["sig"] = currentDetectedSignature;
+    doc["x"] = largestBlock.m_x;
+    doc["y"] = largestBlock.m_y;
+    doc["W"] = largestBlock.m_width;
+    doc["H"] = largestBlock.m_height;
+    doc["A"] = largestBlock.m_width * largestBlock.m_height;
+    doc["det"] = true;
+    
+    //Serial.print("Color Detection - Signature: ");
+    //Serial.print(currentDetectedSignature);
+    //Serial.print(", Position: (");
+    //Serial.print(largestBlock.m_x);
+    //Serial.print(", ");
+    //Serial.print(largestBlock.m_y);
+    //Serial.print("), Size: ");
+    //Serial.print(largestBlock.m_width);
+    //Serial.print("x");
+    //Serial.println(largestBlock.m_height);
+  } else {
+    // No objects detected
+    currentDetectedSignature = -1;
+    doc["sig"] = -1;
+    doc["det"] = false;
+    //Serial.println("Color Detection: No objects detected");
+  }
+  
+  doc["timestamp"] = millis();
+  doc["tBlcks"] = pixy.ccc.numBlocks;
+  
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str());
+}
+// SENDS UNIT CURRENT MODE, ON THE MODE TOPIC, ONLY UNIT PUBLISHES, NO COMMANDS
+void sendModeStatus() {
+  String topic = "UI/" + String(unit_id) + "/MD";
+  StaticJsonDocument<64> doc;
+
+  String modeStr = "unknown";
+  switch (currentMode) {
+    case STANDBY: modeStr = "SB"; break;
+    case MISSION: modeStr = "MS"; break;
+    case GOTO:    modeStr = "GT"; break;
+    case CHARGE:  modeStr = "CG"; break;
+  }
+
+  doc["MD"] = modeStr;
+  doc["timestamp"] = millis();
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topic.c_str(), payload.c_str());
+
+  //Serial.print("Mode Status: ");
+  //Serial.println(modeStr);
+}
+// MQTT TELEMETRY MANAGER
+void handleCommunication() {
+  unsigned long currentTime = millis();
+  
+  // Check if it's time to send LED status
+  if (currentTime - lastLedStatusTime >= LED_STATUS_INTERVAL) {
+    sendLedStatus();
+    lastLedStatusTime = currentTime;
+  }
+  
+  // Check if it's time to send proximity status
+  if (currentTime - lastProxStatusTime >= PROX_STATUS_INTERVAL) {
+    sendProxStatus();
+    lastProxStatusTime = currentTime;
+  }
+  
+  // Check if it's time to send battery status
+  if (currentTime - lastBatStatusTime >= BAT_STATUS_INTERVAL) {
+    sendBatStatus();
+    lastBatStatusTime = currentTime;
+  }
+  // Check if it's time to send color detection status
+  if (currentTime - lastColorStatusTime >= COLOR_STATUS_INTERVAL) {
+    sendColorStatus();
+    lastColorStatusTime = currentTime;
+  }
+  // Check if it's time to send battery status
+  if (currentTime - lastModeStatusTime >= MODE_STATUS_INTERVAL) {
+    sendModeStatus();
+    lastModeStatusTime = currentTime;
+  }
+}
+// MQTT GS MODE INTERPRETER
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  // Ignore /pose topic messages completely
+  if (strstr(topic, "/pose")) {
+    // Parse JSON (optional, if you still need the data)
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+    if (error) return;
+
+    cX = doc["x"];
+    cY = doc["y"];
+    cH = doc["head"];
+    return;
+  }
+
+  // Debug output for all other topics
+  Serial.print("[MQTT] RX: ");
+  Serial.println(topic);
+
+  // Deserialize JSON
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  if (error) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  StaticJsonDocument<64> ack;
+
+  // Handle command updates
+  if (strstr(topic, "/cmd")) {
+    const char* mode = doc["MD"];
+    
+
+    if (!mode) {
+      Serial.println("No mode field in command message.");
+      return;
+    }
+
+    if (strcmp(mode, "SB") == 0) {
+      currentMode = STANDBY;
+      Serial.println("[MODE] Standby");
+      sendModeStatus();
+
+    } else if (strcmp(mode, "MS") == 0) {
+      currentMode = MISSION;
+      Serial.println("[MODE] Mission");
+      sendModeStatus();
+
+    } else if (strcmp(mode, "GT") == 0) {
+      tX = doc["x"];
+      tY = doc["y"];
+      tH = doc["head"];
+      gotoStartTime = millis();
+       PosAcheived   = false;
+       motorKickDone = false;
+       kickStartTime = 0;
+      currentMode = GOTO;
+      Serial.println("[MODE] Go-To");
+      sendModeStatus();
+
+      Serial.print("[GOTO] Target: (");
+      Serial.print(tX);
+      Serial.print(", ");
+      Serial.print(tY);
+      Serial.print(") Heading: ");
+      Serial.println(tH);
+
+    } else if (strcmp(mode, "CG") == 0) {
+      currentMode = CHARGE;
+      Serial.println("[MODE] Charge");
+      sendModeStatus();
+
+    } else {
+      Serial.print("[MODE] Unkown:  ");
+      Serial.println(mode);
+    }
+    ack["MD"] = mode;
+    ack["stat"] = "rcvd";
+    char buffer[64];
+    serializeJson(ack, buffer);
+    mqttClient.publish(("UI/" + String(unit_id) + "/ack").c_str(), buffer);
+  }
+  
+}
+// GOTO mode handler
+void modeGoto() {
+  //GOTO MODE TIMEOUT - ADJUST ABOVE IN GOTO SETTINGS
+  if (millis() - gotoStartTime > gotoTimeoutMs) {
+    stopMotors();
+    currentMode = STANDBY;
+    Serial.println("[WARN] Goto timeout. Aborting and returning to STANDBY.");
+    return;
+  }
+  // MOTOR ANTI-STALL RAMPING KICKSTART
+  if (!motorKickDone) {
+    stallblock();
+    return;  // wait until kick is complete before control logic
+  }
+  //LOCAL VARIABLE INTIALISATION
+  float dx = tX - cX;
+  float dy = tY - cY;
+  float dist = sqrt(dx*dx + dy*dy);
+  float desiredAngle = atan2(dx, -dy) * (180.0 / PI);
+  float errHead = desiredAngle - cH;
+  //Serial.print("[GOTO-DEBUG] {dx: ");
+  //Serial.print(dx, 2);
+  //Serial.print(", dy: ");
+  //Serial.print(dy, 2);
+  //Serial.print(", dh: ");
+  //Serial.print(errHead, 2);
+  //Serial.println("}");
+  // normalize to ±180
+  if (errHead > 180)  errHead -= 360;
+  if (errHead < -180) errHead += 360;
+
+  if (dist > gotoPosTol) {
+    // rotate‑and‑drive with proportional heading control
+    int corr = (int)(kP_heading * errHead);
+    //int corr = constrain(corr, -60, 60); //Overcontraints the Heading Error - 013026
+    setMotorDirection(true, true, constrain(CURVE_SPEED + corr, MIN_SPEED, 255), constrain(CURVE_SPEED - corr, MIN_SPEED, 255));
+
+  } else {
+    stopMotors();
+    if (!PosAcheived) {
+      Serial.println("[INFO] Position reached. GOTO complete.");
+      PosAcheived = true;
+      currentMode = STANDBY;
+      sendModeStatus();
+    }
+  }
+}
+//PLACEHOLDER - CHARGE mode handler
+void modeCharge() {
+  Serial.println("[TEST] Charge mode Called.");
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+// MISSION VARIABLES HERE
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+// MISSION CODE HERE
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+// SETUP LOOP
+void setup() {
+  //HARDWARE + GS CONTROLLER SETUP
+  Serial.begin(19200);
+  pixy.init();
+  vcnl.begin();  
+
+  pinMode(MOTOR_AIN1, OUTPUT);
+  pinMode(MOTOR_AIN2, OUTPUT);
+  pinMode(MOTOR_BIN1, OUTPUT);
+  pinMode(MOTOR_BIN2, OUTPUT);
+  pinMode(LED_DAT_OUT, OUTPUT);
+  
+  strip.begin();
+  strip.clear();
+
+  setup_wifi();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqtt_callback);
+  Serial.println("Robot initialized with communication enabled");
+  
+  randomSeed(analogRead(A0)); //Resets random seed to ensure different random motion occurs on every move
+  isInDelay = false; 
+
+  strip.show();
+  setLED(COLOR_MAGENTA);
+  Serial.println("[SETUP COMPLETE]");
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////
+// MAIN LOOP
+void loop() {
+  // MAINTAINS MQTT CONNECTIONS
+  if (!mqttClient.connected()) {
+    reconnect_mqtt();
+  }
+
+  // HANDLER FUNCTIONS
+  mqttClient.loop();      // MQTT "Im Alive" ping
+  handleCommunication();  // Telemetry Handler
+  handleObstacle();       // Hardware proximity detection updater
+  
+  if (obstacleState == NONE) {
+    switch (currentMode) {
+      case STANDBY:
+        stopMotors();
+        break;
+
+      case GOTO:
+        modeGoto();
+        break;
+
+      case CHARGE:
+        modeCharge();
+        break;
+
+      case MISSION:
+        Serial.println("Debug - MISSION");
+      break;
+
+    }
+  }
+}
