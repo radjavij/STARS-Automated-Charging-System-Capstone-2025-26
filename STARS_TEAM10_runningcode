@@ -630,9 +630,40 @@ void attach(){
   stopMotors();
   currentMode = CHARGE;
 }
-//PLACEHOLDER - CHARGE mode handler
-void modeCharge() {
-  Serial.println("[TEST] Charge mode Called.");
+bool pogoIsActive(){
+
+}
+
+void detach(){
+
+}
+
+void modeCharge(){
+
+}
+
+// THIS FUNCTION IS IF THE ROBOT GETS A INTERRUPT TO END CHARGING FOR PRIORITY OF LOW BATTERY ROBOT
+void modeUnCharge(){ 
+
+}
+
+// CAPSTONE ADD: 
+void modeCompleteCharge() {
+  Serial.println("[MODE] CHARGE Complete");
+
+  checkBatteryVoltage();
+
+  //IF THE MAX CHARGE VALUE OF 3.9V IS ACHIEVED THEN COMMENCE WITH THE DETACHMENT.
+  if(currentBatteryVoltage >= CHARGE_COMPLETE_VOLTAGE){  
+    
+    detach();
+
+  } else {
+
+    stopMotors(NULL);
+    break;
+
+  }
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
