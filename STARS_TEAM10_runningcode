@@ -634,8 +634,43 @@ bool pogoIsActive(){
 
 }
 
-void detach(){
+void detach() {
+  Serial.println("[DETACH] Structured detach w/ retry.");
+  setLED(COLOR_YELLOW);
 
+  // Try #1
+  setMotorDirection(false, false, 0, TURN_SPEED);
+  delay(300);
+  stopMotors();
+  delay(100);
+
+  setMotorDirection(true, false, MAX_DETACH_SPEED, MAX_DETACH_SPEED);
+  delay(DETACH_ROTATION_TIME);
+  stopMotors();
+  delay(150);
+
+  // Emergency kick (short burst) + short follow-up pivot
+  setLED(COLOR_RED);
+  setMotorDirection(true, true, EMERGENCY_KICK_SPEED, EMERGENCY_KICK_SPEED);
+  delay(250);
+  stopMotors();
+  delay(120);
+
+  setLED(COLOR_BLUE);
+  setMotorDirection(true, false, MAX_DETACH_SPEED, MAX_DETACH_SPEED);
+  delay(800);
+  stopMotors();
+  delay(150);
+
+  // Clear pogo
+  setMotorDirection(true, true, BASE_SPEED, BASE_SPEED);
+  delay(BETWEEN_MOVE_DELAY);
+  stopMotors();
+
+  setLED(COLOR_OFF);
+  currentMode = STANDBY;
+  sendModeStatus();
+  Serial.println("[DETACH] Done -> STANDBY");
 }
 
 void modeCharge(){
