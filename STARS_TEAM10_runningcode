@@ -587,6 +587,49 @@ void modeGoto() {
     }
   }
 }
+
+void attach(){
+  const int pulsePWM = 30;
+  const int pulseTime = 60;
+  const int settleTime = 80;
+  const unsigned long timeout = 500000;
+  const float voltageRiseThreshold = 0.05;  // tweak as needed
+
+   float prevVoltage = get_bat_voltage();
+
+  auto isCharging = [&]() -> bool {
+    float currentVoltage = get_bat_voltage();
+    bool rising = (currentVoltage - prevVoltage) > voltageRiseThreshold;   // Maybe put this function outside of the attach function i dont know
+    prevVoltage = currentVoltage;
+    return rising;
+  };
+
+  unsigned long startTime = millis();
+
+  while (!isCharging()) {
+    if (millis() - startTime > timeout) {
+      stopMotors();
+      currentMode = STANDBY;
+      return;
+    }
+,
+    // --- LEFT PULSE ---
+    setMotorDirection(true, true, pulsePWM, 0);
+    delay(pulseTime);
+    stopMotors();
+    delay(settleTime);
+    if (isCharging()) break;
+
+    // --- RIGHT PULSE ---
+    setMotorDirection(true, true, 0, pulsePWM);
+    delay(pulseTime);
+    stopMotors();
+    delay(settleTime);
+  }
+
+  stopMotors();
+  currentMode = CHARGE;
+}
 //PLACEHOLDER - CHARGE mode handler
 void modeCharge() {
   Serial.println("[TEST] Charge mode Called.");
