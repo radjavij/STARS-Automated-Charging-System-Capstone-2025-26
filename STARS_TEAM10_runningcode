@@ -55,6 +55,18 @@ uint32_t currentLedColor = COLOR_OFF;  // Track current LED color
 bool currentProxStatus = false;        // Track current proximity detection status
 float currentBatVoltage = 0.0;         // Track current battery voltage
 int currentDetectedSignature = -1;     // Track current detected color signature -1 = none)
+float pogoPrevVoltage = 0.0f;
+unsigned long pogoPrevSampleMs = 0;
+uint8_t pogoRiseCount = 0;
+uint8_t pogoFallCount = 0;
+bool pogoActiveLatched = false;
+
+const unsigned long POGO_SAMPLE_MS = 200;
+const float POGO_RISE_THRESH_V = 0.02f;
+const float POGO_FALL_THRESH_V = -0.02f;
+const uint8_t POGO_RISE_REQUIRED = 2;
+const uint8_t POGO_FALL_REQUIRED = 4; 
+
 
 //GOTO INITIALISATION
 float tX = 0, tY = 0; //Target position from GOTO command
@@ -89,6 +101,7 @@ unsigned long lastModeStatusTime = 0;
 unsigned long moveStartTime = 0;
 unsigned long moveDuration = 0;
 bool isInDelay = false;
+bool detachBoostOn = false;             //CAPSTONE EDIT: flag for debugging/telemetry
 unsigned long delayStartTime = 0;
 int currentMotionType = 0;
 
@@ -128,6 +141,7 @@ const unsigned long gotoTimeoutMs = 1000 * 30;  // GOTO timeout watchdog timer
 const unsigned long KS_MS = 250;  // Kickstart Ramp time (ms)
 const unsigned long turnPulse = 200;            // ms between rotation checks
 
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // HARDWARE + MOVEMENT FUNCTION DEFENITIONS
 // READS BATTERY VOLTAGE
@@ -138,12 +152,24 @@ double get_bat_voltage(int pin = BAT_RESISTOR_1_2, double divided_max = 2.935, d
 void checkBatteryVoltage() {
   currentBatVoltage = get_bat_voltage();
 }
+
+// Reset pogo charge detector state (call before attach / when entering CHARGE)
+// AI CREATED FUNCTION TO CHECK FUNCTIONALITY
+void pogoDetectorReset() {
+  pogoPrevVoltage = (float)get_bat_voltage();
+  pogoPrevSampleMs = millis();
+  pogoRiseCount = 0;
+  pogoFallCount = 0;
+  pogoActiveLatched = false;
+}
+
 // SETS THE COLOR OF THE ONBOARD LED
 void setLED(uint32_t color) {
   currentLedColor = color;
   strip.setPixelColor(0, color);
   strip.show();
 }
+
 // COMMANDS MOVES BY ALTERING L/R MOTOR DIRECTION AND SPEED
 void setMotorDirection(bool leftFwd, bool rightFwd, int leftSpeed, int rightSpeed) {
   analogWrite(MOTOR_AIN1, leftSpeed);
@@ -339,7 +365,7 @@ void sendProxStatus() {
 }
 // SENDS BAT VOLTAGE STATUS - battery: {'vt': 0.004616, 'timestamp': 24155}
 void sendBatStatus() {
-  String topic = "UI/" + String(unit_id) + "bat";
+  String topic = "UI/" + String(unit_id) + "/bat"; //CAPSTONE EDIT: "/bat" from "bat"
   StaticJsonDocument<64> doc;
   
   currentBatVoltage = get_bat_voltage();
@@ -612,7 +638,7 @@ void attach(){
       currentMode = STANDBY;
       return;
     }
-,
+
     // --- LEFT PULSE ---
     setMotorDirection(true, true, pulsePWM, 0);
     delay(pulseTime);
@@ -631,12 +657,77 @@ void attach(){
   currentMode = CHARGE;
 }
 bool pogoIsActive(){
+  unsigned long now = millis();
 
+  // First-time init
+  if (pogoPrevSampleMs == 0) {
+    pogoPrevVoltage = (float)get_bat_voltage();
+    pogoPrevSampleMs = now;
+    pogoRiseCount = 0;
+    pogoFallCount = 0;
+    pogoActiveLatched = false;
+    return false;
+  }
+
+  // Only evaluate every POGO_SAMPLE_MS
+  if (now - pogoPrevSampleMs < POGO_SAMPLE_MS) {
+    return pogoActiveLatched;
+  }
+
+  float v = (float)get_bat_voltage();
+  float dv = v - pogoPrevVoltage;
+
+  pogoPrevVoltage = v;
+  pogoPrevSampleMs = now;
+
+  // Rising fast enough => count toward active latch
+  if (dv >= POGO_RISE_THRESH_V) {
+    pogoRiseCount++;
+    pogoFallCount = 0;
+  } 
+  // Falling enough => count toward clearing latch
+  else if (dv <= POGO_FALL_THRESH_V) {
+    pogoFallCount++;
+    pogoRiseCount = 0;
+  } 
+  /
+  else {
+    // If we're already latched active, we don't want to drop immediately at high.
+    // Count as a "fall" slowly only when NOT rising (helps detach detection eventually).
+    if (pogoActiveLatched) pogoFallCount++;
+    pogoRiseCount = 0;
+  }
+
+  // Latch ON
+  if (!pogoActiveLatched && pogoRiseCount >= POGO_RISE_REQUIRED) {
+    pogoActiveLatched = true;
+  }
+
+  // Latch OFF (requires multiple confirmations)
+  if (pogoActiveLatched && pogoFallCount >= POGO_FALL_REQUIRED) {
+    pogoActiveLatched = false;
+  }
+
+  return pogoActiveLatched;
+}
+
+void adjustSpeed() {
+  detachBoostOn = true;
+
+  Serial.println("[SPEED] detaching..");
+  setLED(COLOR_YELLOW);
+}
+
+void nominalSpeed() {
+  detachBoostOn = false;
+  Serial.println("[SPEED] nominal");
 }
 
 void detach() {
   Serial.println("[DETACH] Structured detach w/ retry.");
   setLED(COLOR_YELLOW);
+
+  adjustSpeed(); //start detach mode, with flag ON
 
   // Try #1
   setMotorDirection(false, false, 0, TURN_SPEED);
@@ -667,38 +758,35 @@ void detach() {
   delay(BETWEEN_MOVE_DELAY);
   stopMotors();
 
+  nominalSpeed(); //exit detach mode, flag OFF
+
   setLED(COLOR_OFF);
   currentMode = STANDBY;
   sendModeStatus();
   Serial.println("[DETACH] Done -> STANDBY");
 }
 
-void modeCharge(){
-
+void modeCharge() {
+  stopMotors();
+  modeCompleteCharge();
 }
 
 // THIS FUNCTION IS IF THE ROBOT GETS A INTERRUPT TO END CHARGING FOR PRIORITY OF LOW BATTERY ROBOT
-void modeUnCharge(){ 
+void modeUnCharge() { 
 
 }
 
 // CAPSTONE ADD: 
 void modeCompleteCharge() {
-  Serial.println("[MODE] CHARGE Complete");
+  Serial.println("[MODE] CHARGE Complete?");
 
-  checkBatteryVoltage();
+  checkBatteryVoltage(); //This is to update the currentBatVoltage
 
   //IF THE MAX CHARGE VALUE OF 3.9V IS ACHIEVED THEN COMMENCE WITH THE DETACHMENT.
-  if(currentBatteryVoltage >= CHARGE_COMPLETE_VOLTAGE){  
+  if(currentBatVoltage >= CHARGE_COMPLETE_VOLTAGE){  
     
     detach();
-
-  } else {
-
-    stopMotors(NULL);
-    break;
-
-  }
+    return; //removed the break since not in the loop
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -770,4 +858,4 @@ void loop() {
 
     }
   }
-}
+}}
