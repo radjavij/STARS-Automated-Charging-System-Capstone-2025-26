@@ -243,7 +243,7 @@ void handleObstacle() {
 
           //Move back a little to make sure unit wont collide with wall
           setMotorDirection(false, false, TURN_SPEED, TURN_SPEED);
-          delay(AVOID_REVERSE_PULSE);
+          smartWaitMs(AVOID_REVERSE_PULSE);                              //CAPSTONE EDIT: to avoid delay issues, utilize new function. 
           stopMotors();
 
           if (avoidLeft) {
@@ -256,6 +256,7 @@ void handleObstacle() {
           strip.clear();
         }
       }
+
     break;
 
     case AVOIDING:
@@ -267,6 +268,7 @@ void handleObstacle() {
     break;
   }
 }
+
 //STALL BLOCKER - Limits di/dt to blunt instantaneous powerdraw
 void stallblock() {
   // If kick already completed, do nothing
@@ -614,12 +616,29 @@ void modeGoto() {
   }
 }
 
+///////////////////////////////////----------------CAPSTONE 2026 EDITS WITH FUNCTIONS: attach(), detach(), pogoIsActive(), adjustSPeed(), nominalSpeed(), modeCharge(), modeunCharge(), servicedComms(), smartWaitMs()---------/////////////////////////////////////////////////////
+
+// This is to assist in the mqtt from not quitting out and continuing operations
+static inline void serviceComms() {
+  if(mqttClient.connected()) {   //check si the mqtt is connected or not 
+    mqttClient.loop();
+  }
+  handleCommunication();        // return to the mqtt manager 
+}
+
+static inline void smartWaitMs(unsigned long ms) {
+unsigned long start = millis();
+while (millis() - start < ms) {
+  serviceComms();
+}
+}
+
 void attach(){
   const int pulsePWM = 30;
   const int pulseTime = 60;
   const int settleTime = 80;
-  const unsigned long timeout = 500000;
-  const float voltageRiseThreshold = 0.05;  // tweak as needed
+  const unsigned long timeoutMs = 500000;
+  const float voltageRiseThreshold = 0.05f;  // tweak as needed
 
    float prevVoltage = get_bat_voltage();
 
@@ -633,7 +652,7 @@ void attach(){
   unsigned long startTime = millis();
 
   while (!isCharging()) {
-    if (millis() - startTime > timeout) {
+    if (millis() - startTime > timeoutMs) {
       stopMotors();
       currentMode = STANDBY;
       return;
@@ -641,21 +660,23 @@ void attach(){
 
     // --- LEFT PULSE ---
     setMotorDirection(true, true, pulsePWM, 0);
-    delay(pulseTime);
+    smartWaitMs(pulseTime);
     stopMotors();
-    delay(settleTime);
+    smartWaitMs(settleTime);
     if (isCharging()) break;
 
     // --- RIGHT PULSE ---
     setMotorDirection(true, true, 0, pulsePWM);
-    delay(pulseTime);
+    smartWaitMs(pulseTime);
     stopMotors();
-    delay(settleTime);
+    smartWaitMs(settleTime);
   }
 
   stopMotors();
   currentMode = CHARGE;
 }
+
+
 bool pogoIsActive(){
   unsigned long now = millis();
 
@@ -690,7 +711,7 @@ bool pogoIsActive(){
     pogoFallCount++;
     pogoRiseCount = 0;
   } 
-  /
+  
   else {
     // If we're already latched active, we don't want to drop immediately at high.
     // Count as a "fall" slowly only when NOT rising (helps detach detection eventually).
@@ -715,7 +736,7 @@ void adjustSpeed() {
   detachBoostOn = true;
 
   Serial.println("[SPEED] detaching..");
-  setLED(COLOR_YELLOW);
+  setLED(COLOR_RED);
 }
 
 void nominalSpeed() {
@@ -731,31 +752,31 @@ void detach() {
 
   // Try #1
   setMotorDirection(false, false, 0, TURN_SPEED);
-  delay(300);
+  smartWaitMs(300);
   stopMotors();
-  delay(100);
+  smartWaitMs(100);
 
   setMotorDirection(true, false, MAX_DETACH_SPEED, MAX_DETACH_SPEED);
-  delay(DETACH_ROTATION_TIME);
+  smartWaitMs(DETACH_ROTATION_TIME);
   stopMotors();
-  delay(150);
+  smartWaitMs(150);
 
   // Emergency kick (short burst) + short follow-up pivot
   setLED(COLOR_RED);
   setMotorDirection(true, true, EMERGENCY_KICK_SPEED, EMERGENCY_KICK_SPEED);
-  delay(250);
+  smartWaitMs(250);
   stopMotors();
-  delay(120);
+  smartWaitMs(120);
 
   setLED(COLOR_BLUE);
   setMotorDirection(true, false, MAX_DETACH_SPEED, MAX_DETACH_SPEED);
-  delay(800);
+  smartWaitMs(800);
   stopMotors();
-  delay(150);
+  smartWaitMs(150);
 
   // Clear pogo
   setMotorDirection(true, true, BASE_SPEED, BASE_SPEED);
-  delay(BETWEEN_MOVE_DELAY);
+  smartWaitMs(BETWEEN_MOVE_DELAY);
   stopMotors();
 
   nominalSpeed(); //exit detach mode, flag OFF
@@ -766,27 +787,32 @@ void detach() {
   Serial.println("[DETACH] Done -> STANDBY");
 }
 
+// This function is to give a visual indicator of a yellow LED of when the robot begins its charging operation. 
 void modeCharge() {
+  // at this point the robot whould be attached and docked to the charging station
   stopMotors();
-  modeCompleteCharge();
+  setLED(COLOR_YELLOW);
 }
 
 // THIS FUNCTION IS IF THE ROBOT GETS A INTERRUPT TO END CHARGING FOR PRIORITY OF LOW BATTERY ROBOT
 void modeUnCharge() { 
+  detach();
+  currentMode = STANDBY;
+  sendModeStatus();
 
 }
 
-// CAPSTONE ADD: 
-void modeCompleteCharge() {
-  Serial.println("[MODE] CHARGE Complete?");
+// // CAPSTONE ADD: 
+// void modeCompleteCharge() {
+//   Serial.println("[MODE] CHARGE Complete?");
 
-  checkBatteryVoltage(); //This is to update the currentBatVoltage
+//   checkBatteryVoltage(); //This is to update the currentBatVoltage
 
-  //IF THE MAX CHARGE VALUE OF 3.9V IS ACHIEVED THEN COMMENCE WITH THE DETACHMENT.
-  if(currentBatVoltage >= CHARGE_COMPLETE_VOLTAGE){  
+//   //IF THE MAX CHARGE VALUE OF 3.9V IS ACHIEVED THEN COMMENCE WITH THE DETACHMENT.
+//   if(currentBatVoltage >= CHARGE_COMPLETE_VOLTAGE){  
     
-    detach();
-    return; //removed the break since not in the loop
+//     detach();
+//     return; //removed the break since not in the loop
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -858,4 +884,4 @@ void loop() {
 
     }
   }
-}}
+}
