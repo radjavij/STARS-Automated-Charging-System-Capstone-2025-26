@@ -13,9 +13,9 @@
 char ssid[] = "BID4R_Swarm_AP";
 char pass[] = "xXSecure_Password25Xx";
 //IP Address for lab desktop
-const char* mqtt_server = "155.31.130.4";
+const char* mqtt_server = "155.31.130.102";
 const int mqtt_port = 1883;
-const char* unit_id = "014";  // Each robot needs unique ID
+const char* unit_id = "010";  // Each robot needs unique ID
 // DO NOT FORGET TO DEFINE UNIT SPECIFIC PROXMITY SENSOR AND BATTERY MONITORING R_SISTOR VALUES
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -77,11 +77,17 @@ bool motorKickDone = false;
 
 // STATE DEFENTION FOR DELAY HANDLING
 enum ObstacleState { NONE, STOPPED, WAITING, AVOIDING };
-enum DriveMode { STANDBY, MISSION, GOTO, CHARGE };
+enum DriveMode { STANDBY, MISSION, GOTO, CHARGE, UNCHARGE }; // Modified by Graci to include UNCHARGE
 ObstacleState obstacleState = NONE;
 DriveMode currentMode = STANDBY;
 unsigned long obstacleStartTime = 0;
 bool avoidLeft = false;
+
+// CHARGE INITIALIZATION- Added by Graci
+DriveMode storedMode = currentMode; // STORES MODE COMMANDS FOR ROBOT WHEN CHARGING
+float chargeX = 0, chargeY = 0;
+float chargeH = 0;
+boolean chargingProcess = false;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // COMM FREQUENCY SETTINGS
@@ -111,8 +117,8 @@ int currentMotionType = 0;
 #define MIN_SPEED BASE_SPEED * 0.6   // For rotational or "precise" movements [NOTE: Often causes stalls when run from dead stop, just give it a little push]
 #define TURN_SPEED 200               // For obstacle pivoting
 #define PROXIMITY_THRESHOLD 2350
-#define EMERGENCY_KICK_SPEED 255        // CAPSTONE ADD: SHORT BURST VALUE IF THE CONSTINUOUS CW DETACHMENT MOVEMENT DOESNT WORK.
-#define MAX_DETACH_SPEED 250            // CAPSTONE ADD: MAXIMUM SPEED FOR THE SERVO TO BE ABLE TO HELP WITH DETACHING FROM MAGNETIC POGO
+#define EMERGENCY_KICK_SPEED 200        // CAPSTONE ADD: SHORT BURST VALUE IF THE CONSTINUOUS CW DETACHMENT MOVEMENT DOESNT WORK.
+#define MAX_DETACH_SPEED 200            // CAPSTONE ADD: MAXIMUM SPEED FOR THE SERVO TO BE ABLE TO HELP WITH DETACHING FROM MAGNETIC POGO
 
 // MOVEMENT TIMING SETTINGS
 #define FORWARD_MIN_DURATION 1000
@@ -124,10 +130,10 @@ int currentMotionType = 0;
 #define AVOID_REVERSE_PULSE 400
 
 // CAPSTONE ADD: CHARGING SETTINGS
-#define CHARGE_COMPLETE_VOLTAGE 3.9f    // CAPSTONE ADD: THRESHOLD FOR MAX CHARGE IN (v)
-#define MIN_CHARGE_FOR_ASSIST 3.5f      // CAPSTONE ADD: MINIMUM CHARGE TO RESPOND TO EMERGENCY REQUESTS IN (v)
-#define DETACH_TURN_DIRECTION 90.0f     // CAPSTONE ADD: THE DIRECTION IN (deg) FOR THE ROBOT TO DETACH FROM THE CHARGING STATION
-#define DETACH_ROTATION_TIME 3000       // CAPSTONE ADD: 90 DEGREE CW ROTATION IN (ms)
+//#define CHARGE_COMPLETE_VOLTAGE 3.9f    // CAPSTONE ADD: THRESHOLD FOR MAX CHARGE IN (v) Graci- commented this out (never called)
+//#define MIN_CHARGE_FOR_ASSIST 3.5f      // CAPSTONE ADD: MINIMUM CHARGE TO RESPOND TO EMERGENCY REQUESTS IN (v) Graci- commented this out (never called)
+#define DETACH_TURN_DIRECTION 90.0f       // CAPSTONE ADD: THE DIRECTION IN (deg) FOR THE ROBOT TO DETACH FROM THE CHARGING STATION
+#define DETACH_ROTATION_TIME 3000         // CAPSTONE ADD: 90 DEGREE CW ROTATION IN (ms)
 
 //GOTO TOLERANCE AND TUNING SETTINGS
 const float kP_heading = 0.75;    // proportional gain
@@ -137,7 +143,7 @@ const float gotoHeadTol = 15.0;   //Degrees allowable heading error
 unsigned long gotoStartTime = 0;
 unsigned long kickStartTime = 0;
 unsigned long lastTurnUpdate = 0;
-const unsigned long gotoTimeoutMs = 1000 * 30;  // GOTO timeout watchdog timer
+const unsigned long gotoTimeout = 1000 * 30;  // GOTO timeout watchdog timer
 const unsigned long KS_MS = 250;  // Kickstart Ramp time (ms)
 const unsigned long turnPulse = 200;            // ms between rotation checks
 
@@ -145,12 +151,37 @@ const unsigned long turnPulse = 200;            // ms between rotation checks
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // HARDWARE + MOVEMENT FUNCTION DEFENITIONS
 // READS BATTERY VOLTAGE
-double get_bat_voltage(int pin = BAT_RESISTOR_1_2, double divided_max = 2.935, double max_bat_voltage = 4.2) {
-  return (((double)analogRead(pin)) * max_bat_voltage) / ((divided_max / 3.3) * 1023);
+double get_bat_voltage(int pin = BAT_RESISTOR_1_2, double R1 = 100.0, double R2 = 219.4) {
+    int adc = analogRead(pin);
+    double v_pin = adc * (3.3 / 1023.0);  // ADC -> pin voltage
+    double v_bat = v_pin * ((R1 + R2) / R2);  // undo divider
+    return v_bat;
 }
+
 // RETURNS BATTERY VOLTAGE 
 void checkBatteryVoltage() {
   currentBatVoltage = get_bat_voltage();
+}
+// OUTPUTS THE INFO FROM THE BATTERY RESISTOR PIN RAW
+void debug_battery() {
+  int adc = analogRead(BAT_RESISTOR_1_2);
+
+  double v_pin = adc * (3.3 / 1023.0);
+
+  Serial.print("ADC: ");
+  Serial.println(adc);
+
+  Serial.print("Pin voltage: ");
+  Serial.print(v_pin, 3);
+  Serial.println(" V");
+}
+
+//PRINTS THE BATTERY VOLTAGE
+void print_battery_voltage() {
+  double voltage = get_bat_voltage();
+  Serial.print("Battery Voltage: ");
+  Serial.print(voltage, 3);   // 3 decimal places
+  Serial.println(" V");
 }
 
 // Reset pogo charge detector state (call before attach / when entering CHARGE)
@@ -243,7 +274,7 @@ void handleObstacle() {
 
           //Move back a little to make sure unit wont collide with wall
           setMotorDirection(false, false, TURN_SPEED, TURN_SPEED);
-          smartWaitMs(AVOID_REVERSE_PULSE);                              //CAPSTONE EDIT: to avoid delay issues, utilize new function. 
+          delay(AVOID_REVERSE_PULSE);                              //CAPSTONE EDIT: to avoid delay issues, utilize new function. 
           stopMotors();
 
           if (avoidLeft) {
@@ -482,11 +513,11 @@ void handleCommunication() {
     lastModeStatusTime = currentTime;
   }
 }
+
 // MQTT GS MODE INTERPRETER
-void mqtt_callback(char* topic, byte* payload, unsigned int length) {
-  // Ignore /pose topic messages completely
-  if (strstr(topic, "/pose")) {
-    // Parse JSON (optional, if you still need the data)
+void mqtt_callback(char* topic, byte* payload, unsigned int length) { 
+  // Ignore /e topic messages completely
+  if (strstr(topic, "/pose") != NULL) {
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, payload, length);
     if (error) return;
@@ -494,11 +525,11 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     cX = doc["x"];
     cY = doc["y"];
     cH = doc["head"];
-    return;
+    return;  // Exit before any debug output
   }
 
   // Debug output for all other topics
-  Serial.print("[MQTT] RX: ");
+  Serial.print("[MQTT] Message received on topic: ");
   Serial.println(topic);
 
   // Deserialize JSON
@@ -522,43 +553,87 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
       return;
     }
 
-    if (strcmp(mode, "SB") == 0) {
-      currentMode = STANDBY;
-      Serial.println("[MODE] Standby");
-      sendModeStatus();
+    // Checks if robot is charging and should ignore commands: new
+    if ((currentMode == CHARGE) || (currentMode == UNCHARGE)) {
+      // Saves commands to run when finished charging
+      if (strcmp(mode, "SB") == 0) {
+        storedMode = STANDBY;
+        Serial.println("Mode stored as STANDBY");
+        sendModeStatus();
 
-    } else if (strcmp(mode, "MS") == 0) {
-      currentMode = MISSION;
-      Serial.println("[MODE] Mission");
-      sendModeStatus();
+      } else if (strcmp(mode, "MS") == 0) {
+        storedMode = MISSION;
+        Serial.println("Mode stored as MISSION");
+        sendModeStatus();
 
-    } else if (strcmp(mode, "GT") == 0) {
-      tX = doc["x"];
-      tY = doc["y"];
-      tH = doc["head"];
-      gotoStartTime = millis();
-       PosAcheived   = false;
-       motorKickDone = false;
-       kickStartTime = 0;
-      currentMode = GOTO;
-      Serial.println("[MODE] Go-To");
-      sendModeStatus();
+      } else if (strcmp(mode, "GT") == 0) {
+        chargeX = doc["x"];
+        chargeY = doc["y"];
+        chargeH = doc["head"];
+        storedMode = GOTO;
+        sendModeStatus();
 
-      Serial.print("[GOTO] Target: (");
-      Serial.print(tX);
-      Serial.print(", ");
-      Serial.print(tY);
-      Serial.print(") Heading: ");
-      Serial.println(tH);
+        Serial.print("Mode stored as GOTO → Target: (");
+        Serial.print(chargeX);
+        Serial.print(", ");
+        Serial.print(chargeY);
+        Serial.print(") Heading: ");
+        Serial.println(chargeH);
 
-    } else if (strcmp(mode, "CG") == 0) {
-      currentMode = CHARGE;
-      Serial.println("[MODE] Charge");
-      sendModeStatus();
+      } else if (strcmp(mode, "CG") == 0) {
+        storedMode = CHARGE;
+        Serial.println("Mode stored as CHARGE");
+        sendModeStatus();
 
-    } else {
-      Serial.print("[MODE] Unkown:  ");
-      Serial.println(mode);
+      //Runs the stored commands
+      } else if (strcmp(mode, "UN") == 0) {
+        currentMode = UNCHARGE;
+        Serial.println("Mode set to UNCHARGE");
+        sendModeStatus();
+
+      } else {
+        Serial.print("Unknown mode received: ");
+        Serial.println(mode);
+      }
+    } else{
+      if (strcmp(mode, "SB") == 0) {
+        currentMode = STANDBY;
+        Serial.println("Mode set to STANDBY");
+        sendModeStatus();
+
+      } else if (strcmp(mode, "MS") == 0) {
+        currentMode = MISSION;
+        Serial.println("Mode set to MISSION");
+        sendModeStatus();
+
+      } else if (strcmp(mode, "GT") == 0) {
+        tX = doc["x"];
+        tY = doc["y"];
+        tH = doc["head"];
+        gotoStartTime = millis();
+        currentMode = GOTO;
+        sendModeStatus();
+
+        Serial.print("Mode set to GOTO → Target: (");
+        Serial.print(tX);
+        Serial.print(", ");
+        Serial.print(tY);
+        Serial.print(") Heading: ");
+        Serial.println(tH);
+
+      } else if (strcmp(mode, "CG") == 0) {
+        tX = doc["x"];
+        tY = doc["y"];
+        tH = doc["head"];
+        gotoStartTime = millis();
+        currentMode = CHARGE;
+        sendModeStatus();
+        Serial.println("Mode set to CHARGE");
+
+      } else {
+        Serial.print("Unknown mode received: ");
+        Serial.println(mode);
+      }
     }
     ack["MD"] = mode;
     ack["stat"] = "rcvd";
@@ -568,10 +643,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   }
   
 }
+
+
 // GOTO mode handler
 void modeGoto() {
   //GOTO MODE TIMEOUT - ADJUST ABOVE IN GOTO SETTINGS
-  if (millis() - gotoStartTime > gotoTimeoutMs) {
+  if (millis() - gotoStartTime > gotoTimeout) {
     stopMotors();
     currentMode = STANDBY;
     Serial.println("[WARN] Goto timeout. Aborting and returning to STANDBY.");
@@ -618,31 +695,32 @@ void modeGoto() {
 
 ///////////////////////////////////----------------CAPSTONE 2026 EDITS WITH FUNCTIONS: attach(), detach(), pogoIsActive(), adjustSPeed(), nominalSpeed(), modeCharge(), modeunCharge(), servicedComms(), smartWaitMs()---------/////////////////////////////////////////////////////
 
-// This is to assist in the mqtt from not quitting out and continuing operations
-static inline void serviceComms() {
-  if(mqttClient.connected()) {   //check si the mqtt is connected or not 
-    mqttClient.loop();
-  }
-  handleCommunication();        // return to the mqtt manager 
-}
+// // This is to assist in the mqtt from not quitting out and continuing operations
+// static inline void serviceComms() {
+//   if(mqttClient.connected()) {   //check si the mqtt is connected or not 
+//     mqttClient.loop();
+//   }
+//   handleCommunication();        // return to the mqtt manager 
+// }
 
-static inline void smartWaitMs(unsigned long ms) {
-unsigned long start = millis();
-while (millis() - start < ms) {
-  serviceComms();
-}
-}
+// static inline void smartWaitMs(unsigned long ms) {
+// unsigned long start = millis();
+// while (millis() - start < ms) {
+//   serviceComms();
+// }
+// }
 
 void attach(){
-  const int pulsePWM = 30;
-  const int pulseTime = 60;
-  const int settleTime = 80;
-  const unsigned long timeoutMs = 500000;
+  const int pulsePWM = TURN_SPEED;
+  const int pulseTime = 200;             //EDIT: FROM 600 TO 200, IF NTO SUCCESFFUL - 150
+  const int settleTime = 800;            //EDIT: FROM 800 TO 300, IF NOT SUCCESFUL - 250
+  const unsigned long timeout = 10000;
   const float voltageRiseThreshold = 0.05f;  // tweak as needed
 
    float prevVoltage = get_bat_voltage();
 
   auto isCharging = [&]() -> bool {
+    delay(100);
     float currentVoltage = get_bat_voltage();
     bool rising = (currentVoltage - prevVoltage) > voltageRiseThreshold;   // Maybe put this function outside of the attach function i dont know
     prevVoltage = currentVoltage;
@@ -652,7 +730,7 @@ void attach(){
   unsigned long startTime = millis();
 
   while (!isCharging()) {
-    if (millis() - startTime > timeoutMs) {
+    if (millis() - startTime > timeout) {
       stopMotors();
       currentMode = STANDBY;
       return;
@@ -660,20 +738,19 @@ void attach(){
 
     // --- LEFT PULSE ---
     setMotorDirection(true, true, pulsePWM, 0);
-    smartWaitMs(pulseTime);
+    delay(pulseTime);
     stopMotors();
-    smartWaitMs(settleTime);
+    delay(settleTime);
     if (isCharging()) break;
 
     // --- RIGHT PULSE ---
     setMotorDirection(true, true, 0, pulsePWM);
-    smartWaitMs(pulseTime);
+    delay(pulseTime);
     stopMotors();
-    smartWaitMs(settleTime);
+    delay(settleTime);
   }
 
   stopMotors();
-  currentMode = CHARGE;
 }
 
 
@@ -752,31 +829,31 @@ void detach() {
 
   // Try #1
   setMotorDirection(false, false, 0, TURN_SPEED);
-  smartWaitMs(300);
+  delay(300);
   stopMotors();
-  smartWaitMs(100);
+  delay(100);
 
   setMotorDirection(true, false, MAX_DETACH_SPEED, MAX_DETACH_SPEED);
-  smartWaitMs(DETACH_ROTATION_TIME);
+  delay(DETACH_ROTATION_TIME);
   stopMotors();
-  smartWaitMs(150);
+  delay(150);
 
   // Emergency kick (short burst) + short follow-up pivot
   setLED(COLOR_RED);
   setMotorDirection(true, true, EMERGENCY_KICK_SPEED, EMERGENCY_KICK_SPEED);
-  smartWaitMs(250);
+  delay(250);
   stopMotors();
-  smartWaitMs(120);
+  delay(120);
 
   setLED(COLOR_BLUE);
   setMotorDirection(true, false, MAX_DETACH_SPEED, MAX_DETACH_SPEED);
-  smartWaitMs(800);
+  delay(800);
   stopMotors();
-  smartWaitMs(150);
+  delay(150);
 
   // Clear pogo
   setMotorDirection(true, true, BASE_SPEED, BASE_SPEED);
-  smartWaitMs(BETWEEN_MOVE_DELAY);
+  delay(BETWEEN_MOVE_DELAY);
   stopMotors();
 
   nominalSpeed(); //exit detach mode, flag OFF
@@ -789,6 +866,12 @@ void detach() {
 
 // This function is to give a visual indicator of a yellow LED of when the robot begins its charging operation. 
 void modeCharge() {
+  //chargingProcess = true;
+  //modeGoto();
+  //currentMode = CHARGE;
+  chargingProcess = false;
+  //Insert finding and attaching to port behavior here:
+  attach();
   // at this point the robot whould be attached and docked to the charging station
   stopMotors();
   setLED(COLOR_YELLOW);
@@ -797,10 +880,39 @@ void modeCharge() {
 // THIS FUNCTION IS IF THE ROBOT GETS A INTERRUPT TO END CHARGING FOR PRIORITY OF LOW BATTERY ROBOT
 void modeUnCharge() { 
   detach();
-  currentMode = STANDBY;
+    // Returns t values to stored commands
+  tX = chargeX;
+  tY = chargeY;
+  tH = chargeH;
+  // Begins stored mode action
+  currentMode = storedMode;
+  // Sends and prints status
   sendModeStatus();
+  if (currentMode == STANDBY){
+    Serial.println("Mode set to STANDBY");
 
+  } else if (currentMode == MISSION){
+      Serial.println("Mode set to MISSON");
+
+  } else if (currentMode == GOTO){
+      gotoStartTime = millis();
+      Serial.println("Mode set to GOTO → Target: (");
+      Serial.print(tX);
+      Serial.print(", ");
+      Serial.print(tY);
+      Serial.print(") Heading: ");
+      Serial.println(tH);
+
+  } else if (currentMode == CHARGE){
+      Serial.println("Mode set to CHARGE");
+
+  } else{
+      Serial.print("Unknown mode received: ");
+      Serial.println("unknown");
+
+  }
 }
+
 
 // // CAPSTONE ADD: 
 // void modeCompleteCharge() {
@@ -813,7 +925,7 @@ void modeUnCharge() {
     
 //     detach();
 //     return; //removed the break since not in the loop
-}
+
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 // MISSION VARIABLES HERE
@@ -863,11 +975,16 @@ void loop() {
   mqttClient.loop();      // MQTT "Im Alive" ping
   handleCommunication();  // Telemetry Handler
   handleObstacle();       // Hardware proximity detection updater
-  
+  print_battery_voltage(); 
+  debug_battery();
+  delay(2000);
+
   if (obstacleState == NONE) {
     switch (currentMode) {
       case STANDBY:
-        stopMotors();
+        if (!chargingProcess){
+          stopMotors();
+        }
         break;
 
       case GOTO:
@@ -875,7 +992,13 @@ void loop() {
         break;
 
       case CHARGE:
-        modeCharge();
+        if (!chargingProcess){
+          modeCharge();
+        }
+        break;
+
+      case UNCHARGE:
+        modeUnCharge();
         break;
 
       case MISSION:
